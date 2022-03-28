@@ -256,20 +256,26 @@ def get_third_causal_explanation(action_description: ActionDescription, scenario
     Set[Tuple[Event, FluentLiteral]], Set[FluentLiteral]]:
     initial_state, event_chain = scenario_path
     if transition_event is None and outcome is None:
-        outcome = event_chain[-1]
-        transition_event = event_chain[-2]
+        transition_event, outcome = event_chain[-1]
     elif transition_event is None or outcome is None:
         for (event, state) in reversed(scenario_path):
             if outcome is None:
-                pass
+                if event == transition_event:
+                    outcome = state
+                    break
             elif transition_event is None:
-                pass
+                if state == outcome:
+                    transition_event = event
+                    break
 
     preconditions = action_description.preconditions(transition_event)
     supporting_events = set()
     uncaused_literals = set()
     for precondition in preconditions:
-        pass
+        ensuring_event = get_ensuring_event(scenario_path, precondition)
+        if ensuring_event is None:
+            uncaused_literals.add(precondition)
+        else:
+            supporting_events.add((ensuring_event, precondition))
 
-
-
+    return supporting_events, uncaused_literals
