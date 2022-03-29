@@ -3,6 +3,10 @@ from collections import namedtuple
 from copy import deepcopy
 from typing import Set, Tuple, Sequence, FrozenSet, Iterable, List, Optional
 
+import clingo
+
+from action_language_interpreter.util import symbol_to_str
+
 Event = str
 Fluent = str
 
@@ -48,8 +52,8 @@ def change_state(state: State, *fluent_literals: FluentLiteral) -> State:
             if state_fluent == fluent:
                 if state_sign != sign:
                     next_state.discard(state_fluent_literal)
-                    next_state.add(fluent_literal)
                 break
+        next_state.add(fluent_literal)
     return next_state
 
 
@@ -112,6 +116,12 @@ class ActionDescription:
         self.state_constraints: Set[StateConstraint] = set()
         self.executability_conditions: Set[ExecutabilityCondition] = set()
 
+    def __repr__(self):
+        return repr((self.dynamic_laws, self.state_constraints, self.executability_conditions))
+
+    def __str__(self):
+        return str((self.dynamic_laws, self.state_constraints, self.executability_conditions))
+
     def add_stmt_causes_if(self, event, fluent_literal, *conditions):
         self.dynamic_laws.add(DynamicLaw(event, fluent_literal, *conditions))
 
@@ -122,8 +132,8 @@ class ActionDescription:
         self.executability_conditions.add(ExecutabilityCondition(event, *conditions))
 
     def executable_events(self, state: Set[FluentLiteral], events: Sequence[Event]) -> Tuple[
-        FrozenSet[Event], Sequence[ExecutabilityCondition]]:
-        possible_events = []
+        Set[Event], Sequence[ExecutabilityCondition]]:
+        possible_events = set()
         relevant_executability_conditions = set()
         for event in events:
             possible = True
@@ -132,14 +142,17 @@ class ActionDescription:
                     relevant_executability_conditions.add(executablility_condition)
                     possible = False
             if possible:
-                possible_events.append(event)
+                possible_events.add(event)
 
-        return frozenset(possible_events), tuple(relevant_executability_conditions)
+        return possible_events, tuple(relevant_executability_conditions)
 
     def execute(self, state: State, event: Event) -> Tuple[State, Sequence[ALStatement]]:
         next_state_pass1, relevant_statements_pass1 = self._execute_dynamic_laws(state, event)
         next_state, relevant_statements = self._execute_state_constraints(next_state_pass1, relevant_statements_pass1)
         return next_state, relevant_statements
+
+    def comply(self, state: State) -> Tuple[State, Sequence[ALStatement]]:
+        return self._execute_state_constraints(state, [])
 
     def _execute_dynamic_laws(self, state: State, event: Event) -> Tuple[State, List[ALStatement]]:
         relevant_dynamic_laws: List[DynamicLaw] = [dynamic_law for dynamic_law in self.dynamic_laws if
@@ -155,14 +168,15 @@ class ActionDescription:
         while change:
             change = False
             for state_constraint in self.state_constraints:
-                if state_constraint not in relevant_statements and state_constraint.fires(state):
+                if state_constraint not in relevant_statements and state_constraint.fires(next_state):
                     change = True
                     next_state = change_state(next_state, state_constraint.fluent_literal)
                     relevant_statements.append(state_constraint)
         return next_state, relevant_statements
 
-    def direct_effects(self, event: Event) -> Set[FluentLiteral]:
-        return {dynamic_law.fluent_literal for dynamic_law in self.dynamic_laws if dynamic_law.event == event}
+    def direct_effects(self, event: Event, state: Optional[State] = None) -> Set[FluentLiteral]:
+        return {dynamic_law.fluent_literal for dynamic_law in self.dynamic_laws if
+                dynamic_law.event == event and (state is None or dynamic_law.fires(state, event))}
 
     def preconditions(self, event: Event) -> Set[FluentLiteral]:
         preconditions = set()
@@ -174,11 +188,27 @@ class ActionDescription:
                 preconditions.update(map(operator.neg, executability_condition.conditions))
         return preconditions
 
-    def __repr__(self):
-        return repr((self.dynamic_laws, self.state_constraints, self.executability_conditions))
 
-    def __str__(self):
-        return str((self.dynamic_laws, self.state_constraints, self.executability_conditions))
+def from_clingo_symbols(symbols:Sequence[clingo.Symbol]) -> ActionDescription:
+    ad = ActionDescription()
+    for symbol in symbols: # type: clingo.Symbol
+        if symbol.type == clingo.SymbolType.Function:
+            if symbol.name == "causes":
+                event = symbol.arguments[0]
+                effect = symbol.arguments[1]
+                conditions = symbol.arguments[2:]
+                ad.add_stmt_causes_if(symbol_to_str(event), FluentLiteral(symbol_to_str(effect)), *map(FluentLiteral, map(symbol_to_str,conditions)))
+            elif symbol.name == "impossible_if":
+                event = symbol.arguments[0]
+                conditions = symbol.arguments[1:]
+                ad.add_stmt_impossible_if(event, *conditions)
+            elif symbol.name == "if":
+                effect = symbol.arguments[0]
+                conditions = symbol.arguments[1:]
+                ad.add_stmt_if(effect, *conditions)
+    return ad
+
+
 
 
 def get_transition_events(scenario_path: ScenarioPath, outcome: State) -> Set[Event]:
@@ -199,13 +229,13 @@ def get_effects(action_description: ActionDescription, scenario_path: ScenarioPa
     event_chain: List[Tuple[Event, State]]
     initial_state, event_chain = scenario_path
     if outcome is None:
-        outcome = event_chain[-1]
+        _, outcome = event_chain[-1]
     previous_state: State = initial_state
     for (event, current_state) in event_chain:
         if transition_event is None or transition_event == event:
             if not (outcome <= previous_state) and (outcome <= current_state):
                 inertial_literals = previous_state & current_state
-                direct_effects = action_description.direct_effects(event)
+                direct_effects = action_description.direct_effects(event, previous_state)
                 indirect_effects = outcome & (current_state - (direct_effects | inertial_literals))
                 return direct_effects, indirect_effects
         previous_state = current_state
@@ -237,7 +267,7 @@ def get_second_causal_explanation(scenario_path: ScenarioPath, outcome: Optional
         effects = direct_effects | indirect_effects
     if outcome is None:
         initial_state, event_chain = scenario_path
-        outcome = event_chain[-1]
+        transition_event, outcome = event_chain[-1]
     remaining_outcome_literals = outcome - effects
     supporting_literals = set()
     initial_literals = set()
@@ -258,7 +288,7 @@ def get_third_causal_explanation(action_description: ActionDescription, scenario
     if transition_event is None and outcome is None:
         transition_event, outcome = event_chain[-1]
     elif transition_event is None or outcome is None:
-        for (event, state) in reversed(scenario_path):
+        for (event, state) in reversed(event_chain):
             if outcome is None:
                 if event == transition_event:
                     outcome = state
