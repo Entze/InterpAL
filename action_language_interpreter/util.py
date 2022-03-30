@@ -23,6 +23,8 @@ def symbol_to_str(symbol: Symbol) -> str:
             elif current.type == SymbolType.Supremum:
                 string += "#sup"
             elif current.type == SymbolType.Function:
+                if current.negative:
+                    string += '-'
                 string += current.name
                 if current.arguments:
                     stack.append(')')
